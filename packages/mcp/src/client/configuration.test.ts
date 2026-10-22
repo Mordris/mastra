@@ -695,6 +695,36 @@ describe('MCPClient clientInfo identity', () => {
     await Promise.all([a.disconnect(), b.disconnect()]);
   });
 
+  it('keeps auto-generated ids unchanged when registerProcessHooks is true', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4323/mcp') } };
+    const client = new MCPClient({ servers, registerProcessHooks: true });
+    const expected = createHash('sha256')
+      .update('MCPClient')
+      .update(JSON.stringify(servers).normalize('NFKC'))
+      .digest('hex');
+    expect((client as any).id).toBe(expected);
+    await client.disconnect();
+  });
+
+  it('treats clients with different registerProcessHooks as distinct instances', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4324/mcp') } };
+    const a = new MCPClient({ servers });
+    const b = new MCPClient({ servers, registerProcessHooks: false });
+    expect((a as any).id).not.toBe((b as any).id);
+    await Promise.all([a.disconnect(), b.disconnect()]);
+  });
+
+  it('replaces a cached explicit-id client when registerProcessHooks changes', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4325/mcp') } };
+    const id = `process-hooks-identity-${++clientId}`;
+    const a = new MCPClient({ id, servers });
+    const b = new MCPClient({ id, servers, registerProcessHooks: false });
+    expect(b).not.toBe(a);
+    const again = new MCPClient({ id, servers, registerProcessHooks: false });
+    expect(again).toBe(b);
+    await Promise.all([a.disconnect(), b.disconnect()]);
+  });
+
   it('replaces a cached explicit-id client when clientInfo changes', async () => {
     const legacy = await recordingLegacyServer();
     const servers = { weather: { url: new URL(`${legacy.url}?server=weather`) } };
@@ -731,6 +761,35 @@ describe('MCPClient clientInfo identity', () => {
     const b = new MCPClient({ id, servers, clientInfo });
     expect(b).not.toBe(a);
     await Promise.all([a.disconnect(), b.disconnect()]);
+  });
+});
+
+describe('MCPClient registerProcessHooks', () => {
+  // Counts SIGHUP: exit-hook adds its own SIGTERM listener once per process, so a SIGTERM count
+  // depends on whether an earlier test already connected a client.
+  async function sighupListenersAfterConnect(options: { registerProcessHooks?: boolean }) {
+    const legacy = await recordingLegacyServer();
+    const client = new MCPClient({
+      id: `process-hooks-test-${++clientId}`,
+      servers: { weather: { url: new URL(`${legacy.url}?server=weather`) } },
+      ...options,
+    });
+    const before = process.listenerCount('SIGHUP');
+    try {
+      await client.listTools();
+      return process.listenerCount('SIGHUP') - before;
+    } finally {
+      await client.disconnect();
+      await legacy.close();
+    }
+  }
+
+  it('installs the process hooks by default', async () => {
+    expect(await sighupListenersAfterConnect({})).toBe(1);
+  });
+
+  it('skips the process hooks on every server when set to false', async () => {
+    expect(await sighupListenersAfterConnect({ registerProcessHooks: false })).toBe(0);
   });
 });
 

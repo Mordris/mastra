@@ -79,6 +79,21 @@ export interface MCPClientOptions {
    */
   clientInfo?: MCPClientInfo;
   /**
+   * Whether the client installs process hooks that disconnect its servers when the process ends
+   * (default: `true`).
+   *
+   * The hooks handle `SIGINT`, `SIGTERM`, `SIGHUP` and `beforeExit`, and end the process once the
+   * servers are disconnected. That also ends any graceful shutdown your application runs on the same
+   * signals, such as draining in-flight requests.
+   *
+   * Set this to `false` when your application handles shutdown itself, and call `disconnect()` from
+   * that handler. A stdio server's child process normally exits when your process does, because its
+   * stdin closes, but only `disconnect()` closes it cleanly. Set it on every `MCPClient` in the
+   * process: once one client installs the hooks, their `SIGINT` and `SIGTERM` listeners stay until
+   * the process ends.
+   */
+  registerProcessHooks?: boolean;
+  /**
    * Webhook delivery for MCP Events. Servers that offer webhook delivery POST occurrences to
    * `webhook.url`, which must route to {@link MCPClient.events}`.handleWebhook()`.
    *
@@ -118,6 +133,7 @@ export class MCPClient extends MastraBase {
   private id: string;
   private defaultTimeout: number;
   private defaultClientInfo?: MCPClientInfo;
+  private registerProcessHooks: boolean;
   private webhook?: EventsWebhookSetup;
   private mcpClientsById = new Map<string, InternalMastraMCPClient>();
   private disconnectPromise: Promise<void> | null = null;
@@ -141,6 +157,7 @@ export class MCPClient extends MastraBase {
    * @param args.id - Optional unique identifier to allow multiple instances with same config
    * @param args.servers - Map of server names to server configurations
    * @param args.timeout - Optional global timeout in milliseconds (default: 60000)
+   * @param args.registerProcessHooks - Set to `false` to skip the process exit and signal hooks (default: true)
    *
    * @throws {Error} If multiple instances with identical config are created without an ID
    *
@@ -163,6 +180,7 @@ export class MCPClient extends MastraBase {
     super({ name: 'MCPClient' });
     this.defaultTimeout = args.timeout ?? DEFAULT_REQUEST_TIMEOUT_MSEC;
     this.defaultClientInfo = args.clientInfo && { ...args.clientInfo };
+    this.registerProcessHooks = args.registerProcessHooks ?? true;
     this.serverConfigs = args.servers;
     this.webhook = args.webhook && { options: { ...args.webhook }, receiver: new WebhookReceiver() };
     this.id = args.id ?? this.makeId();
@@ -171,7 +189,12 @@ export class MCPClient extends MastraBase {
       this.id = args.id;
       const cached = mcpClientInstances.get(this.id);
 
-      if (cached && (!equal(cached.serverConfigs, args.servers) || !equal(cached.defaultClientInfo, args.clientInfo))) {
+      if (
+        cached &&
+        (!equal(cached.serverConfigs, args.servers) ||
+          !equal(cached.defaultClientInfo, args.clientInfo) ||
+          cached.registerProcessHooks !== (args.registerProcessHooks ?? true))
+      ) {
         const existingInstance = mcpClientInstances.get(this.id);
         if (existingInstance) {
           void existingInstance.disconnect();
@@ -720,10 +743,15 @@ To fix this you have three different options:
   }
 
   private makeId() {
+    // Options left at their default stay out of the hash, so ids of existing clients don't change.
     const text = JSON.stringify(
-      this.defaultClientInfo === undefined
+      this.defaultClientInfo === undefined && this.registerProcessHooks
         ? this.serverConfigs
-        : { servers: this.serverConfigs, clientInfo: this.defaultClientInfo },
+        : {
+            servers: this.serverConfigs,
+            ...(this.defaultClientInfo === undefined ? {} : { clientInfo: this.defaultClientInfo }),
+            ...(this.registerProcessHooks ? {} : { registerProcessHooks: false }),
+          },
     ).normalize('NFKC');
     return createHash('sha256').update('MCPClient').update(text).digest('hex');
   }
@@ -1584,6 +1612,7 @@ To fix this you have three different options:
       name,
       server: config,
       timeout: config.timeout ?? this.defaultTimeout,
+      registerProcessHooks: this.registerProcessHooks,
       clientInfo: {
         name: config.clientInfo?.name ?? this.defaultClientInfo?.name,
         version: config.clientInfo?.version ?? this.defaultClientInfo?.version,

@@ -2556,6 +2556,28 @@ describe('MastraMCPClient - Resource Cleanup Tests', () => {
     expect(afterDisconnectCount).toBe(initialListenerCount);
   });
 
+  it('should not install process hooks when registerProcessHooks is false', async () => {
+    const initialSigTerm = process.listenerCount('SIGTERM');
+    const initialSigHup = process.listenerCount('SIGHUP');
+    const initialExitHooks = exitHooks.live;
+
+    const client = new InternalMastraMCPClient({
+      name: 'no-process-hooks-client',
+      registerProcessHooks: false,
+      server: {
+        url: testServer.baseUrl,
+      },
+    });
+
+    await client.connect();
+
+    expect(process.listenerCount('SIGTERM')).toBe(initialSigTerm);
+    expect(process.listenerCount('SIGHUP')).toBe(initialSigHup);
+    expect(exitHooks.live).toBe(initialExitHooks);
+
+    await client.disconnect();
+  });
+
   it('should not add duplicate listeners when connect is called multiple times on the same client', async () => {
     const initialListenerCount = process.listenerCount('SIGTERM');
 

@@ -522,6 +522,13 @@ export type InternalMastraMCPClientOptions = {
   clientInfo?: MCPClientInfo;
   /** Optional timeout in milliseconds */
   timeout?: number;
+  /**
+   * Whether this client installs the process exit and signal hooks that disconnect it when the
+   * process ends. See `MCPClientOptions.registerProcessHooks`.
+   *
+   * @default true
+   */
+  registerProcessHooks?: boolean;
   /** Webhook settings and receiver shared by the owning `MCPClient`'s servers. */
   webhook?: EventsWebhookSetup;
 };

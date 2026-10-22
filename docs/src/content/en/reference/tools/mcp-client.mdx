@@ -24,6 +24,7 @@ constructor({
   servers: Record<string, MastraMCPServerDefinition>;
   timeout?: number;
   clientInfo?: { name?: string; version?: string };
+  registerProcessHooks?: boolean;
 }: MCPClientOptions)
 ```
 
@@ -59,6 +60,14 @@ constructor({
     isOptional: true,
     description:
       "Client name and version every server receives on connect and with each request, so servers can attribute traffic to your application. Defaults to the server key as `name` and `'1.0.0'` as `version`. Individual server configs can override either field with their own `clientInfo`. Doesn't change tool name prefixes, which always use the server key.",
+  },
+  {
+    name: 'registerProcessHooks',
+    type: 'boolean',
+    isOptional: true,
+    defaultValue: 'true',
+    description:
+      'Whether the client installs hooks that disconnect its servers when the process ends. The hooks handle `SIGINT`, `SIGTERM`, `SIGHUP` and `beforeExit`, and end the process once the servers are disconnected, which also ends a graceful shutdown your application runs on the same signals. Set to `false` when your application handles shutdown itself, and call `disconnect()` from that handler. See [Handle shutdown yourself](#handle-shutdown-yourself).',
   },
   {
     name: 'webhook',
@@ -1731,6 +1740,31 @@ MCPClient handles server connections gracefully:
 1. Automatic connection management for multiple servers
 1. Graceful server shutdown to prevent error messages during development
 1. Proper cleanup of resources when disconnecting
+
+### Handle shutdown yourself
+
+By default, a connected client installs hooks for `SIGINT`, `SIGTERM`, `SIGHUP` and `beforeExit` that disconnect its servers and then end the process. This stops stdio server subprocesses when your process exits. It also ends any shutdown of your own that runs on the same signals, for example draining in-flight HTTP requests, before that shutdown finishes.
+
+If your application handles shutdown itself, set `registerProcessHooks` to `false` and call `disconnect()` from your handler:
+
+```typescript
+const mcp = new MCPClient({
+  servers: {/* ... */},
+  registerProcessHooks: false,
+})
+
+process.once('SIGTERM', async () => {
+  await server.drain() // your own cleanup
+  await mcp.disconnect()
+  process.exit(0)
+})
+```
+
+With the hooks off, nothing disconnects the client for you. A stdio server's subprocess normally exits when your process does, because its stdin closes, but only `disconnect()` closes it cleanly.
+
+The [Mastra server](/docs/deployment/mastra-server#graceful-shutdown-and-rolling-deploys) already drains requests on `SIGINT` and `SIGTERM`, so there `registerProcessHooks: false` is enough. Don't call `disconnect()` from a second signal handler: it runs when the drain starts, while requests can still use the client. To disconnect after the drain, set [`server.handleShutdownSignals`](/reference/configuration#serverhandleshutdownsignals) to `false` and call `disconnect()` after `mastra.shutdown()` in your own handler.
+
+Set the option on every `MCPClient` in the process. Once one client installs the hooks, their `SIGINT` and `SIGTERM` listeners stay until the process ends.
 
 ## Using custom fetch for runtime-defined authentication
 
