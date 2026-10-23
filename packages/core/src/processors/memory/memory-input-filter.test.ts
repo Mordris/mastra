@@ -263,6 +263,77 @@ describe('MemoryInputFilter', () => {
     });
   });
 
+  describe('a response stored as several rows', () => {
+    // A state signal added between two steps stores the rest of the response in a new row, so a
+    // client tool call can be held by a later row than the one whose id the client copy carries.
+    const toolPart = (toolCallId: string, toolInvocation: Record<string, unknown>) =>
+      ({
+        type: 'tool-invocation',
+        toolInvocation: { toolCallId, toolName: toolCallId, args: {}, ...toolInvocation },
+      }) as MastraDBMessage['content']['parts'][number];
+    const firstRow = message('a1', 'assistant', [toolPart('server', { state: 'result', result: 'server' })]);
+    const signalRow = message('s1', 'signal', [{ type: 'text', text: 'state' }]);
+    const clientCopy = message('a1', 'assistant', [
+      toolPart('server', { state: 'result', result: 'server' }),
+      { type: 'text', text: 'calling' },
+      toolPart('client', { state: 'result', result: 'client' }),
+    ]);
+    const next = message('u2', 'user', [{ type: 'text', text: 'next' }]);
+
+    it('keeps an update under the id of the later row that holds the pending call', async () => {
+      const { messageList, processor } = setup([
+        firstRow,
+        signalRow,
+        message('a2', 'assistant', [{ type: 'text', text: 'calling' }, toolPart('client', { state: 'call' })]),
+      ]);
+      messageList.add([clientCopy, next], 'input');
+
+      await process(processor, messageList);
+
+      const retained = messageList.get.input.db();
+      expect(retained.map(item => item.id)).toEqual(['a2', 'u2']);
+      expect(retained[0]?.content.parts).toMatchObject([{ toolInvocation: { toolCallId: 'client', state: 'result' } }]);
+    });
+
+    it('drops an update when the later row already finished the call', async () => {
+      const { messageList, processor } = setup([
+        firstRow,
+        signalRow,
+        message('a2', 'assistant', [toolPart('client', { state: 'result', result: 'stored' })]),
+      ]);
+      messageList.add([clientCopy, next], 'input');
+
+      await process(processor, messageList);
+
+      expect(messageList.get.input.db().map(item => item.id)).toEqual(['u2']);
+    });
+
+    it('does not match a call held by a row after the next stored user message', async () => {
+      const { messageList, processor } = setup([
+        firstRow,
+        message('u1', 'user', [{ type: 'text', text: 'later' }]),
+        message('a2', 'assistant', [toolPart('client', { state: 'call' })]),
+      ]);
+      messageList.add([clientCopy, next], 'input');
+
+      await process(processor, messageList);
+
+      expect(messageList.get.input.db().map(item => item.id)).toEqual(['u2']);
+    });
+
+    it('does not list the following rows when the first row holds every updated call', async () => {
+      const { listMessages, messageList, processor } = setup([
+        message('a1', 'assistant', [toolPart('client', { state: 'call' })]),
+      ]);
+      messageList.add([message('a1', 'assistant', [toolPart('client', { state: 'result' })]), next], 'input');
+
+      await process(processor, messageList);
+
+      expect(messageList.get.input.db().map(item => item.id)).toEqual(['a1', 'u2']);
+      expect(listMessages).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('does not look up the assistant before a new user message when it carries no tool updates', async () => {
     const { listMessagesById, messageList, processor } = setup([
       message('stored', 'assistant', [{ type: 'text', text: 'stored' }]),

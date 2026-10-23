@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { MockMemory } from '../../memory/mock';
+import type { InputProcessor } from '../../processors';
 import { createTool } from '../../tools';
 import { Agent } from '../agent';
+import type { MastraDBMessage } from '../message-list';
 import { MockLanguageModelV2, convertArrayToReadableStream } from './mock-model';
 
 /**
@@ -313,6 +315,181 @@ describe('client tool updates on an existing thread', () => {
         { toolCallId: 'call_1', state: 'result', result: { color: 'red' } },
       ]);
     });
+  });
+
+  describe('when a state signal stored the response as several rows', () => {
+    // A state signal added between two steps of one response starts a new stored row for the
+    // rest of the response. Here the first step runs a server tool and the second ends on a
+    // client tool call, so the pending call is held by the second row. A client sends its copy
+    // of the response under the id of the first row: as one UI message, or as one message per
+    // row, which the input merges into the first.
+    const stateLane: InputProcessor = {
+      id: 'state-lane',
+      computeStateSignal: ({ stepNumber }) => (stepNumber === 1 ? { cacheKey: 'v1', contents: 'state v1' } : undefined),
+    };
+
+    async function setupSplitResponse() {
+      const prompts: any[] = [];
+      const memory = new MockMemory();
+      const agent = new Agent({
+        id: 'client-tools-split',
+        name: 'client-tools-split',
+        instructions: 'x',
+        model: new MockLanguageModelV2({
+          doStream: async ({ prompt }) => {
+            prompts.push(prompt);
+            const text = (delta: string) => [
+              { type: 'text-start' as const, id: 't' },
+              { type: 'text-delta' as const, id: 't', delta },
+              { type: 'text-end' as const, id: 't' },
+            ];
+            return {
+              rawCall: { rawPrompt: null, rawSettings: {} },
+              warnings: [],
+              stream: convertArrayToReadableStream([
+                { type: 'stream-start', warnings: [] },
+                ...(prompts.length === 1
+                  ? [{ type: 'tool-call' as const, toolCallId: 'call_lookup', toolName: 'lookup', input: '{}' }]
+                  : prompts.length === 2
+                    ? [
+                        ...text('Here are the colors.'),
+                        {
+                          type: 'tool-call' as const,
+                          toolCallId: 'call_1',
+                          toolName: 'pickColor',
+                          input: '{"hint":"warm"}',
+                        },
+                      ]
+                    : text(`reply ${prompts.length}`)),
+                { type: 'finish', finishReason: prompts.length <= 2 ? 'tool-calls' : 'stop', usage },
+              ]),
+            };
+          },
+        }),
+        memory,
+        inputProcessors: [stateLane],
+        tools: {
+          lookup: createTool({
+            id: 'lookup',
+            description: 'Looks up the available colors',
+            inputSchema: z.object({}),
+            execute: async () => ({ colors: ['red', 'blue'] }),
+          }),
+          pickColor: createTool({
+            id: 'pickColor',
+            description: 'Asks the user to pick a color in the UI',
+            inputSchema: z.object({ hint: z.string() }),
+          }),
+        },
+      });
+      const threadId = randomUUID();
+      const memoryOpts = { memory: { thread: threadId, resource: 'r', options: { lastMessages: 20 } } };
+      const stored = async () => (await memory.recall({ threadId, resourceId: 'r', perPage: 100 })).messages;
+      const stream = async (messages: any[]) => {
+        const output = await agent.stream(messages, memoryOpts);
+        await output.consumeStream();
+        return prompts.at(-1) as any[];
+      };
+
+      await stream([{ id: 'u1', role: 'user', parts: [{ type: 'text', text: 'pick one' }] }]);
+      const rows = (await stored()).filter(message => message.role === 'assistant');
+      return { rows, stream, stored };
+    }
+
+    const lookupResult = {
+      toolCallId: 'call_lookup',
+      toolName: 'lookup',
+      args: {},
+      state: 'result',
+      result: { colors: ['red', 'blue'] },
+    };
+    const pickColorResult = {
+      toolCallId: 'call_1',
+      toolName: 'pickColor',
+      args: { hint: 'warm' },
+      state: 'result',
+      result: { color: 'red' },
+    };
+    const clientCopies = {
+      'one UI message under the id of the first row': (rows: MastraDBMessage[]) => [
+        {
+          id: rows[0]!.id,
+          role: 'assistant' as const,
+          parts: [
+            {
+              type: 'tool-lookup' as const,
+              toolCallId: 'call_lookup',
+              state: 'output-available' as const,
+              input: {},
+              output: { colors: ['red', 'blue'] },
+            },
+            { type: 'text' as const, text: 'Here are the colors.' },
+            {
+              type: 'tool-pickColor' as const,
+              toolCallId: 'call_1',
+              state: 'output-available' as const,
+              input: { hint: 'warm' },
+              output: { color: 'red' },
+            },
+          ],
+        },
+      ],
+      'one message per stored row': (rows: MastraDBMessage[]) => [
+        {
+          id: rows[0]!.id,
+          role: 'assistant' as const,
+          parts: [{ type: 'tool-invocation', toolInvocation: lookupResult }],
+        },
+        {
+          id: rows[1]!.id,
+          role: 'assistant' as const,
+          parts: [
+            { type: 'text', text: 'Here are the colors.' },
+            { type: 'tool-invocation', toolInvocation: pickColorResult },
+          ],
+        },
+      ],
+    };
+
+    it('stores the pending client call in the second row', async () => {
+      const { rows } = await setupSplitResponse();
+
+      expect(rows).toHaveLength(2);
+      expect(toolParts([rows[0]])).toMatchObject([{ toolCallId: 'call_lookup', state: 'result' }]);
+      expect(toolParts([rows[1]])).toMatchObject([{ toolCallId: 'call_1', state: 'call' }]);
+    });
+
+    it.each(Object.entries(clientCopies))(
+      'keeps a client tool result sent together with the next user message as %s',
+      async (_, clientCopy) => {
+        const { rows, stream, stored } = await setupSplitResponse();
+
+        const prompt = await stream([
+          { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'pick one' }] },
+          ...clientCopy(rows),
+          { id: 'u2', role: 'user', parts: [{ type: 'text', text: 'thanks' }] },
+        ]);
+
+        expect(promptToolResults(prompt)).toEqual([
+          { type: 'json', value: { colors: ['red', 'blue'] } },
+          { type: 'json', value: { color: 'red' } },
+        ]);
+        expect(promptUserText(prompt)).toContain('thanks');
+
+        const messages = await stored();
+        expect(messages.filter(message => message.role === 'user').map(message => message.id)).toEqual(['u1', 'u2']);
+        expect(toolParts(messages.filter(message => message.id === rows[1]!.id))).toMatchObject([
+          { toolCallId: 'call_1', state: 'result', result: { color: 'red' } },
+        ]);
+        expect(toolParts(messages.filter(message => message.id === rows[0]!.id))).toMatchObject([lookupResult]);
+
+        const nextPrompt = await stream([{ id: 'u3', role: 'user', parts: [{ type: 'text', text: 'and now?' }] }]);
+        expect(promptToolResults(nextPrompt)).toEqual([
+          { type: 'json', value: { colors: ['red', 'blue'] } },
+          { type: 'json', value: { color: 'red' } },
+        ]);
+      },
+    );
   });
 
   it('seeds an empty thread with the full input, including client tool results', async () => {

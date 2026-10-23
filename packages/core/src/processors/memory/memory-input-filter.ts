@@ -40,7 +40,8 @@
  *     (the normal client shape sends no ids, so ids and `createdAt` come from the server, and a
  *     client-supplied `createdAt` cannot reorder the thread). If that assistant message carries
  *     client tool updates (a result, error, denial, or approval answer), keep the ones that fill
- *     in a call its stored copy still has pending; see `advanceStoredToolCalls`.
+ *     in a call its stored copy still has pending, even when a later row of the same response
+ *     holds the call; see `advanceStoredToolCalls`.
  *   - ends with an assistant message → keep only its trailing run of client tool updates. This
  *     is the client-side tool flow: the assistant turn was stored with a pending call, and the
  *     client is returning the outcome for it. Everything earlier in that message is already
@@ -90,6 +91,27 @@ export interface MemoryInputFilterOptions {
    * the parent request's messages).
    */
   retainFullInput?: boolean;
+}
+
+/** The stored row that holds each tool call, by call id, with the call's stored state. */
+type CallHolders = Map<string, { row: MastraDBMessage; state: MastraToolInvocationPart['toolInvocation']['state'] }>;
+
+/** Puts each tool part on a copy of `message` under the id of the stored row that holds its call. */
+function onHoldingRows(
+  message: MastraDBMessage,
+  parts: MastraToolInvocationPart[],
+  holders: CallHolders,
+): MastraDBMessage[] {
+  const partsByRow = new Map<string, MastraToolInvocationPart[]>();
+  for (const part of parts) {
+    const rowId = holders.get(part.toolInvocation.toolCallId)?.row.id ?? message.id;
+    partsByRow.set(rowId, [...(partsByRow.get(rowId) ?? []), part]);
+  }
+  return [...partsByRow].map(([id, rowParts]) => ({
+    ...message,
+    id,
+    content: { ...message.content, content: '', parts: rowParts },
+  }));
 }
 
 function stripAssistantProviderMetadata(message: MastraDBMessage): MastraDBMessage {
@@ -217,8 +239,8 @@ export class MemoryInputFilter implements Processor {
     }
 
     if (boundaryAssistant) {
-      const advanced = await this.advanceStoredToolCalls(boundaryAssistant, threadId);
-      if (advanced) retainedInput = [advanced, ...retainedInput];
+      const advanced = await this.advanceStoredToolCalls(boundaryAssistant, threadId, resourceId);
+      retainedInput = [...advanced, ...retainedInput];
     }
 
     messageList.clear.input.db();
@@ -236,31 +258,78 @@ export class MemoryInputFilter implements Processor {
    * If the message isn't stored under that id, keep none: the AI SDK client can fold several
    * server messages into one UI message under a new id, and then a client result can't be told
    * apart from a duplicated server result.
+   *
+   * A kept tool part is returned under the id of the stored row that holds its call, which is not
+   * always the row with the message's id (see `findCallHolders`).
    */
   private async advanceStoredToolCalls(
     message: MastraDBMessage,
     threadId: string,
-  ): Promise<MastraDBMessage | undefined> {
+    resourceId: string | undefined,
+  ): Promise<MastraDBMessage[]> {
     const updates = message.content.parts.filter(
       (part): part is MastraToolInvocationPart =>
         part.type === 'tool-invocation' && isClientToolInvocationUpdate(part.toolInvocation.state),
     );
-    if (updates.length === 0 || !message.id) return undefined;
+    if (updates.length === 0 || !message.id) return [];
 
+    const holders = await this.findCallHolders(message, updates, threadId, resourceId);
+    if (!holders) return [];
+
+    const advancing = updates.filter(part => {
+      const holder = holders.get(part.toolInvocation.toolCallId);
+      return holder !== undefined && advancesToolInvocationState(holder.state, part.toolInvocation.state);
+    });
+    return onHoldingRows(message, advancing, holders);
+  }
+
+  /**
+   * Finds the stored row that holds each updated call. Returns undefined when the message isn't
+   * stored under its id in this thread.
+   *
+   * A response can be stored as several rows: a state signal added between two steps starts a new
+   * row for the rest of the response. A client still sends the response as one message under the
+   * id of its first row (one UI message, or one message per row that the input list merges into
+   * the first), so a call can be held by a later row. When the row with the message's id doesn't
+   * hold every updated call, the assistant rows after it, up to the next user message, are
+   * searched as well. The first row that holds a call wins.
+   */
+  private async findCallHolders(
+    message: MastraDBMessage,
+    updates: MastraToolInvocationPart[],
+    threadId: string,
+    resourceId: string | undefined,
+  ): Promise<CallHolders | undefined> {
     const { messages } = await this.storage.listMessagesById({ messageIds: [message.id] });
     const stored = messages.find(candidate => candidate.id === message.id && candidate.threadId === threadId);
     if (!stored) return undefined;
 
-    const storedStates = new Map<string, MastraToolInvocationPart['toolInvocation']['state']>();
-    for (const part of stored.content.parts) {
-      if (part.type === 'tool-invocation') storedStates.set(part.toolInvocation.toolCallId, part.toolInvocation.state);
-    }
-    const advancing = updates.filter(part => {
-      const storedState = storedStates.get(part.toolInvocation.toolCallId);
-      return storedState !== undefined && advancesToolInvocationState(storedState, part.toolInvocation.state);
-    });
-    if (advancing.length === 0) return undefined;
+    const holders: CallHolders = new Map();
+    const addHolder = (row: MastraDBMessage) => {
+      for (const part of row.content.parts) {
+        if (part.type !== 'tool-invocation') continue;
+        const holder = holders.get(part.toolInvocation.toolCallId);
+        if (!holder || holder.row === row) {
+          holders.set(part.toolInvocation.toolCallId, { row, state: part.toolInvocation.state });
+        }
+      }
+    };
 
-    return { ...message, content: { ...message.content, content: '', parts: advancing } };
+    addHolder(stored);
+    if (updates.some(part => !holders.has(part.toolInvocation.toolCallId))) {
+      const { messages: later } = await this.storage.listMessages({
+        threadId,
+        resourceId,
+        filter: { dateRange: { start: stored.createdAt } },
+        orderBy: { field: 'createdAt', direction: 'ASC' },
+        perPage: false,
+        includeTotal: false,
+      });
+      for (const row of later) {
+        if (row.role === 'user') break;
+        if (row.role === 'assistant' && row.id !== stored.id) addHolder(row);
+      }
+    }
+    return holders;
   }
 }
