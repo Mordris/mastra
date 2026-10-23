@@ -94,6 +94,8 @@ For a thread with no stored messages, the entire input seeds the conversation. P
 
 A client tool outcome is a tool invocation in the `result`, `output-error`, `output-denied`, or `approval-responded` state. An outcome on an assistant message that isn't stored under its ID is dropped, because the AI SDK client can fold several server messages into one UI message under a new ID, and then a client outcome can't be told apart from a duplicated server result.
 
+One response can be stored as several assistant messages, for example when a state signal is added between two of its steps (`workingMemory.useStateSignals`). A client still sends the response under the ID of its first stored message, so each outcome is matched to the stored message that holds its call: the one with that ID, or an assistant message stored after it, up to the next user message.
+
 Trailing user messages are treated as new messages and kept as sent. When they carry no ID the server assigns one. Echoed copies of already-stored messages never replace the stored row, so the stored timestamps and provider metadata stay authoritative for that message.
 
 ### Stored messages as the base layer
