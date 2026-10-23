@@ -295,6 +295,21 @@ describe('MemoryInputFilter', () => {
       expect(retained[0]?.content.parts).toMatchObject([{ toolInvocation: { toolCallId: 'client', state: 'result' } }]);
     });
 
+    it('moves a trailing update to the id of the later row that holds the call', async () => {
+      const { messageList, processor } = setup([
+        firstRow,
+        signalRow,
+        message('a2', 'assistant', [{ type: 'text', text: 'calling' }, toolPart('client', { state: 'call' })]),
+      ]);
+      messageList.add(clientCopy, 'input');
+
+      await process(processor, messageList);
+
+      const retained = messageList.get.input.db();
+      expect(retained.map(item => item.id)).toEqual(['a2']);
+      expect(retained[0]?.content.parts).toMatchObject([{ toolInvocation: { toolCallId: 'client', state: 'result' } }]);
+    });
+
     it('drops an update when the later row already finished the call', async () => {
       const { messageList, processor } = setup([
         firstRow,

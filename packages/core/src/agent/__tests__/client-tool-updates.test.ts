@@ -490,6 +490,29 @@ describe('client tool updates on an existing thread', () => {
         ]);
       },
     );
+
+    it.each(Object.entries(clientCopies))('keeps a client tool result sent on its own as %s', async (_, clientCopy) => {
+      const { rows, stream, stored } = await setupSplitResponse();
+
+      const prompt = await stream([
+        { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'pick one' }] },
+        ...clientCopy(rows),
+      ]);
+
+      expect(promptToolResults(prompt)).toEqual([
+        { type: 'json', value: { colors: ['red', 'blue'] } },
+        { type: 'json', value: { color: 'red' } },
+      ]);
+      expect(toolParts((await stored()).filter(message => message.id === rows[1]!.id))).toMatchObject([
+        { toolCallId: 'call_1', state: 'result', result: { color: 'red' } },
+      ]);
+
+      const nextPrompt = await stream([{ id: 'u3', role: 'user', parts: [{ type: 'text', text: 'and now?' }] }]);
+      expect(promptToolResults(nextPrompt)).toEqual([
+        { type: 'json', value: { colors: ['red', 'blue'] } },
+        { type: 'json', value: { color: 'red' } },
+      ]);
+    });
   });
 
   it('seeds an empty thread with the full input, including client tool results', async () => {

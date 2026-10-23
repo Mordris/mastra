@@ -46,7 +46,8 @@
  *     is the client-side tool flow: the assistant turn was stored with a pending call, and the
  *     client is returning the outcome for it. Everything earlier in that message is already
  *     stored. An update for a call the stored copy already finished is ignored when the two
- *     copies are layered in `MessageList.add`.
+ *     copies are layered in `MessageList.add`. An update for a call that a later row of the same
+ *     response holds is moved to that row's id.
  *   - ends with an assistant message and no new results → drop it, but only if it exists in
  *     storage (see the `listMessagesById` check below). Internal callers such as the agent
  *     network pass assistant-role instruction messages that were never persisted; those are
@@ -172,13 +173,13 @@ export class MemoryInputFilter implements Processor {
     const lastMessage = input.at(-1)!;
     let retainedInput: MastraDBMessage[];
     let boundaryAssistant: MastraDBMessage | undefined;
+    const trailingResults: MastraToolInvocationPart[] = [];
 
     if (lastMessage.role === 'user') {
       const lastAssistantIndex = input.findLastIndex(message => message.role === 'assistant');
       retainedInput = input.slice(lastAssistantIndex + 1);
       boundaryAssistant = input[lastAssistantIndex];
     } else if (lastMessage.role === 'assistant') {
-      const trailingResults: Extract<MastraMessagePart, { type: 'tool-invocation' }>[] = [];
       for (let index = lastMessage.content.parts.length - 1; index >= 0; index--) {
         const part = lastMessage.content.parts[index]!;
         // Stream data parts (e.g. observational memory buffering markers) are appended
@@ -241,6 +242,12 @@ export class MemoryInputFilter implements Processor {
     if (boundaryAssistant) {
       const advanced = await this.advanceStoredToolCalls(boundaryAssistant, threadId, resourceId);
       retainedInput = [...advanced, ...retainedInput];
+    } else if (trailingResults.length > 0 && lastMessage.id) {
+      // Move each trailing update onto the stored row that holds its call, the same as an update
+      // sent with the next user message. Updates no stored row holds stay on the message, and the
+      // same-id layering in MessageList.add still decides what each one may change.
+      const holders = await this.findCallHolders(lastMessage, trailingResults, threadId, resourceId);
+      if (holders) retainedInput = onHoldingRows(lastMessage, trailingResults, holders);
     }
 
     messageList.clear.input.db();
